@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-🤖 ربات ارسال PDF به ادمین — نسخه فایل‌های حجیم + اسم دلخواه
-آماده برای Railway / GitHub
+🤖 ربات ارسال PDF به ادمین + پنل مدیریت کاربران
+نسخه نهایی — چند فایل همزمان + سرعت بالا + اسم دلخواه
 """
 
 import os
 import re
+import json
 import html
 import time
 import shutil
@@ -18,6 +19,8 @@ from urllib.parse import urlparse, unquote
 
 import aiohttp
 from telethon import TelegramClient, events, Button
+from telethon.network.connection.tcpabridged import ConnectionTcpAbridged
+from telethon.tl.types import DocumentAttributeFilename
 
 # ═══════════════════════ تنظیمات از Environment Variables ═══════════════════════
 API_ID        = int(os.getenv("API_ID", "0"))
@@ -25,11 +28,11 @@ API_HASH      = os.getenv("API_HASH", "")
 BOT_TOKEN     = os.getenv("BOT_TOKEN", "")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
 
-ALLOWED_USERS = set()  # مثال: {111111, 222222}
-
-MAX_SIZE       = 2 * 1024 * 1024 * 1024   # ۲ گیگابایت
-CHUNK_SIZE     = 512 * 1024
-PROGRESS_EVERY = 1.8
+MAX_SIZE          = 2 * 1024 * 1024 * 1024   # ۲ گیگابایت
+CHUNK_SIZE        = 512 * 1024
+PROGRESS_EVERY    = 3.5
+MAX_CONCURRENT    = 3                        # حداکثر آپلود همزمان (سرعت کم نشه)
+ALLOWED_FILE      = "allowed_users.json"
 # ═══════════════════════════════════════════════════════════════════════════════
 
 logging.basicConfig(
@@ -40,11 +43,52 @@ log = logging.getLogger("pdf-bot")
 
 URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
-# وضعیت کاربران (برای پرسیدن اسم)
-user_states = {}  # {user_id: {"url": str, "status": Message}}
+# وضعیت‌ها
+user_states = {}          # {user_id: {"url": str}}
+allowed_users = set()     # کاربران مجاز
+upload_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 
-bot = TelegramClient("pdf_bot_session", API_ID, API_HASH)
+bot = TelegramClient(
+    "pdf_bot_session",
+    API_ID,
+    API_HASH,
+    connection=ConnectionTcpAbridged,
+    connection_retries=5,
+    retry_delay=1,
+    timeout=30,
+    auto_reconnect=True,
+)
 bot.parse_mode = "html"
+
+
+# ─────────────────────────── مدیریت کاربران مجاز ───────────────────────────
+def load_allowed():
+    global allowed_users
+    try:
+        if os.path.exists(ALLOWED_FILE):
+            with open(ALLOWED_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                allowed_users = set(data)
+                log.info("کاربران مجاز بارگذاری شد: %s", allowed_users)
+    except Exception as e:
+        log.warning("خطا در بارگذاری کاربران مجاز: %s", e)
+        allowed_users = set()
+
+
+def save_allowed():
+    try:
+        with open(ALLOWED_FILE, "w", encoding="utf-8") as f:
+            json.dump(list(allowed_users), f)
+    except Exception as e:
+        log.error("خطا در ذخیره کاربران مجاز: %s", e)
+
+
+def is_allowed(user_id: int) -> bool:
+    if user_id == ADMIN_CHAT_ID:
+        return True
+    if not allowed_users:          # لیست خالی = همه مجاز
+        return True
+    return user_id in allowed_users
 
 
 # ─────────────────────────── ابزارها ───────────────────────────
@@ -174,27 +218,36 @@ async def process_link(event, url: str, custom_name: str | None = None):
 
         original_name, size = await download_pdf(url, raw_path, status)
 
-        # اگر اسم دلخواه داده شده باشه از اون استفاده کن
         final_name = sanitize(custom_name) if custom_name else sanitize(original_name)
-
         final_path = os.path.join(tmpdir, final_name)
         os.rename(raw_path, final_path)
 
-        await status.edit("⬆️ <b>دانلود کامل شد!</b>\nدر حال ارسال به ادمین...")
+        await status.edit("⬆️ <b>دانلود کامل شد!</b>\nدر صف ارسال به ادمین...")
 
-        up_state = {"t": 0.0, "p": -1}
+        # محدودیت همزمانی آپلود برای حفظ سرعت
+        async with upload_semaphore:
+            await status.edit("⬆️ <b>در حال ارسال سریع به ادمین</b>...")
 
-        async def upload_progress(current: int, total: int):
-            await edit_progress(status, up_state, "⬆️ <b>در حال ارسال به ادمین</b>", current, total)
+            up_state = {"t": 0.0, "p": -1}
 
-        sender = await event.get_sender()
-        await bot.send_file(
-            ADMIN_CHAT_ID,
-            final_path,
-            caption=build_caption(final_name, size, url, sender),
-            force_document=True,
-            progress_callback=upload_progress,
-        )
+            async def upload_progress(current: int, total: int):
+                await edit_progress(status, up_state, "⬆️ <b>در حال ارسال سریع به ادمین</b>", current, total)
+
+            input_file = await bot.upload_file(
+                final_path,
+                progress_callback=upload_progress,
+                part_size_kb=512
+            )
+
+            sender = await event.get_sender()
+            await bot.send_file(
+                ADMIN_CHAT_ID,
+                input_file,
+                caption=build_caption(final_name, size, url, sender),
+                force_document=True,
+                attributes=[DocumentAttributeFilename(final_name)],
+                file_name=final_name
+            )
 
         await status.edit(
             f"✅ <b>انجام شد!</b>\n\n"
@@ -210,7 +263,71 @@ async def process_link(event, url: str, custom_name: str | None = None):
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-# ─────────────────────── هندلرها ───────────────────────
+# ─────────────────────── پنل ادمین ───────────────────────
+@bot.on(events.NewMessage(pattern=r"^/(panel|admin|add|remove|list|allowall)"))
+async def admin_panel(event):
+    if event.sender_id != ADMIN_CHAT_ID:
+        return
+
+    text = event.raw_text.strip()
+    parts = text.split()
+    cmd = parts[0].lower()
+
+    if cmd in ("/panel", "/admin"):
+        count = len(allowed_users)
+        mode = "همه کاربران مجاز هستند" if count == 0 else f"{count} کاربر مجاز"
+        await event.reply(
+            f"🛠 <b>پنل مدیریت ربات</b>\n\n"
+            f"وضعیت فعلی: <b>{mode}</b>\n\n"
+            f"<b>دستورات:</b>\n"
+            f"• <code>/add 123456789</code> — اضافه کردن کاربر\n"
+            f"• <code>/remove 123456789</code> — حذف کاربر\n"
+            f"• <code>/list</code> — لیست کاربران مجاز\n"
+            f"• <code>/allowall</code> — اجازه به همه (پاک کردن لیست)"
+        )
+        return
+
+    if cmd == "/list":
+        if not allowed_users:
+            await event.reply("📋 لیست خالی است → <b>همه کاربران</b> می‌توانند استفاده کنند.")
+        else:
+            users = "\n".join(f"• <code>{uid}</code>" for uid in sorted(allowed_users))
+            await event.reply(f"📋 <b>کاربران مجاز:</b>\n\n{users}")
+        return
+
+    if cmd == "/allowall":
+        allowed_users.clear()
+        save_allowed()
+        await event.reply("✅ لیست پاک شد. الان <b>همه کاربران</b> می‌توانند از ربات استفاده کنند.")
+        return
+
+    if cmd == "/add" and len(parts) == 2:
+        try:
+            uid = int(parts[1])
+            allowed_users.add(uid)
+            save_allowed()
+            await event.reply(f"✅ کاربر <code>{uid}</code> اضافه شد.")
+        except ValueError:
+            await event.reply("❌ آیدی باید عدد باشد.")
+        return
+
+    if cmd == "/remove" and len(parts) == 2:
+        try:
+            uid = int(parts[1])
+            if uid in allowed_users:
+                allowed_users.discard(uid)
+                save_allowed()
+                await event.reply(f"✅ کاربر <code>{uid}</code> حذف شد.")
+            else:
+                await event.reply("ℹ️ این کاربر در لیست نبود.")
+        except ValueError:
+            await event.reply("❌ آیدی باید عدد باشد.")
+        return
+
+    await event.reply("❌ دستور ناقص است. از /panel استفاده کنید.")
+
+
+# ─────────────────────── هندلرهای عمومی ───────────────────────
 @bot.on(events.NewMessage(pattern=r"^/(start|id)$"))
 async def cmd_handler(event):
     if event.raw_text == "/start":
@@ -218,8 +335,9 @@ async def cmd_handler(event):
             "👋 <b>سلام!</b>\n\n"
             "من ربات ارسال PDF به ادمین هستم 🤖\n\n"
             "📌 <b>طریقه استفاده:</b>\n"
-            "۱. لینک مستقیم فایل PDF را بفرست\n"
-            "۲. اگر خواستی اسم دلخواه بده، وگرنه بنویس <code>خیر</code>\n\n"
+            "• لینک مستقیم PDF را بفرست\n"
+            "• اگر یک لینک باشه می‌تونی اسم دلخواه بدی\n"
+            "• چند لینک همزمان هم پشتیبانی می‌شه\n\n"
             f"📦 حداکثر حجم: <b>{human_size(MAX_SIZE)}</b>"
         )
     else:
@@ -234,7 +352,7 @@ async def handle_message(event):
     if text.startswith("/"):
         return
 
-    # اگر کاربر در حال وارد کردن اسم دلخواه است
+    # در حال وارد کردن اسم دلخواه
     if user_id in user_states:
         state = user_states.pop(user_id)
         url = state["url"]
@@ -249,40 +367,43 @@ async def handle_message(event):
         asyncio.create_task(process_link(event, url, custom_name))
         return
 
-    # پیدا کردن لینک
+    # بررسی دسترسی
+    if not is_allowed(user_id):
+        await event.reply("⛔ شما مجاز به استفاده از این ربات نیستید.")
+        return
+
     urls = URL_RE.findall(text)
     if not urls:
         return
 
-    if ALLOWED_USERS and user_id not in ALLOWED_USERS:
-        log.warning("کاربر غیرمجاز: %s", user_id)
+    # یک لینک → پرسیدن اسم دلخواه
+    if len(urls) == 1:
+        url = urls[0]
+        await event.reply(
+            "📝 <b>آیا می‌خواید اسم دلخواه برای این فایل بذارید؟</b>\n\n"
+            "• اگر بله → الان اسم مورد نظرتون رو بنویسید\n"
+            "• اگر نه → بنویسید: <code>خیر</code>",
+            buttons=[[Button.text("خیر (اسم اصلی)")]]
+        )
+        user_states[user_id] = {"url": url}
         return
 
-    # فعلاً فقط اولین لینک رو پردازش می‌کنیم (برای سادگی و جلوگیری از شلوغی)
-    url = urls[0]
-
-    # سوال در مورد اسم دلخواه
-    msg = await event.reply(
-        "📝 <b>آیا می‌خواید اسم دلخواه برای این فایل بذارید؟</b>\n\n"
-        "• اگر بله → الان اسم مورد نظرتون رو بنویسید\n"
-        "• اگر نه → فقط بنویسید: <code>خیر</code>",
-        buttons=[
-            [Button.text("خیر (اسم اصلی)")],
-        ]
-    )
-
-    user_states[user_id] = {"url": url, "status": msg}
+    # چند لینک → همزمان با اسم اصلی
+    await event.reply(f"🔗 {len(urls)} لینک پیدا شد. در حال پردازش همزمان...")
+    for url in urls:
+        asyncio.create_task(process_link(event, url, None))
 
 
 # ─────────────────────── اجرا ───────────────────────
 async def main():
     if not all([API_ID, API_HASH, BOT_TOKEN, ADMIN_CHAT_ID]):
-        log.error("❌ متغیرهای محیطی (API_ID, API_HASH, BOT_TOKEN, ADMIN_CHAT_ID) تنظیم نشده‌اند!")
+        log.error("❌ متغیرهای محیطی تنظیم نشده‌اند!")
         return
 
+    load_allowed()
     await bot.start(bot_token=BOT_TOKEN)
     me = await bot.get_me()
-    log.info("🤖 ربات روشن شد: @%s | سقف حجم: %s", me.username, human_size(MAX_SIZE))
+    log.info("🤖 ربات روشن شد: @%s | سقف همزمانی آپلود: %d", me.username, MAX_CONCURRENT)
     await bot.run_until_disconnected()
 
 
