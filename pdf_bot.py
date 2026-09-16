@@ -34,7 +34,7 @@ from telethon import TelegramClient, events, Button
 from telethon.network.connection.tcpabridged import ConnectionTcpAbridged
 from telethon.tl.types import (DocumentAttributeFilename, BotCommand,
                                BotCommandScopeDefault)
-from telethon.tl.functions.help import SetBotCommandsRequest
+from telethon.tl.functions.bots import SetBotCommandsRequest   # ✅ درست
 from telethon.errors import FloodWaitError
 
 # ═══════════════════ تنظیمات اصلی ═══════════════════
